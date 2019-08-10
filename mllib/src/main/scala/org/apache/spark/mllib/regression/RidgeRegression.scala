@@ -45,15 +45,13 @@ class RidgeRegressionModel @Since("1.1.0") (
       dataMatrix: Vector,
       weightMatrix: Vector,
       intercept: Double): Double = {
-    weightMatrix.toBreeze.dot(dataMatrix.toBreeze) + intercept
+    weightMatrix.asBreeze.dot(dataMatrix.asBreeze) + intercept
   }
 
   @Since("1.3.0")
   override def save(sc: SparkContext, path: String): Unit = {
     GLMRegressionModel.SaveLoadV1_0.save(sc, path, this.getClass.getName, weights, intercept)
   }
-
-  override protected def formatVersion: String = "1.0"
 }
 
 @Since("1.3.0")
@@ -86,7 +84,7 @@ object RidgeRegressionModel extends Loader[RidgeRegressionModel] {
  * See also the documentation for the precise formulation.
  */
 @Since("0.8.0")
-class RidgeRegressionWithSGD private (
+class RidgeRegressionWithSGD private[mllib] (
     private var stepSize: Double,
     private var numIterations: Int,
     private var regParam: Double,
@@ -107,6 +105,8 @@ class RidgeRegressionWithSGD private (
    * regParam: 0.01, miniBatchFraction: 1.0}.
    */
   @Since("0.8.0")
+  @deprecated("Use ml.regression.LinearRegression with elasticNetParam = 0.0. Note the default " +
+    "regParam is 0.01 for RidgeRegressionWithSGD, but is 0.0 for LinearRegression.", "2.0.0")
   def this() = this(1.0, 100, 0.01, 1.0)
 
   override protected def createModel(weights: Vector, intercept: Double) = {
@@ -119,6 +119,8 @@ class RidgeRegressionWithSGD private (
  *
  */
 @Since("0.8.0")
+@deprecated("Use ml.regression.LinearRegression with elasticNetParam = 0.0. Note the default " +
+  "regParam is 0.01 for RidgeRegressionWithSGD, but is 0.0 for LinearRegression.", "2.0.0")
 object RidgeRegressionWithSGD {
 
   /**

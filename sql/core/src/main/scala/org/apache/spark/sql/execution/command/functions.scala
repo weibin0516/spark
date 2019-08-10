@@ -17,9 +17,12 @@
 
 package org.apache.spark.sql.execution.command
 
-import org.apache.spark.sql.{AnalysisException, Row, SQLContext}
+import java.util.Locale
+
+import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
 import org.apache.spark.sql.catalyst.FunctionIdentifier
-import org.apache.spark.sql.catalyst.catalog.CatalogFunction
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, NoSuchFunctionException}
+import org.apache.spark.sql.catalyst.catalog.{CatalogFunction, FunctionResource}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, ExpressionInfo}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
@@ -28,47 +31,65 @@ import org.apache.spark.sql.types.{StringType, StructField, StructType}
  * The DDL command that creates a function.
  * To create a temporary function, the syntax of using this command in SQL is:
  * {{{
- *    CREATE TEMPORARY FUNCTION functionName
+ *    CREATE [OR REPLACE] TEMPORARY FUNCTION functionName
  *    AS className [USING JAR\FILE 'uri' [, JAR|FILE 'uri']]
  * }}}
  *
  * To create a permanent function, the syntax in SQL is:
  * {{{
- *    CREATE FUNCTION [databaseName.]functionName
+ *    CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] [databaseName.]functionName
  *    AS className [USING JAR\FILE 'uri' [, JAR|FILE 'uri']]
  * }}}
+ *
+ * @param ignoreIfExists: When true, ignore if the function with the specified name exists
+ *                        in the specified database.
+ * @param replace: When true, alter the function with the specified name
  */
-// TODO: Use Seq[FunctionResource] instead of Seq[(String, String)] for resources.
-case class CreateFunction(
+case class CreateFunctionCommand(
     databaseName: Option[String],
     functionName: String,
     className: String,
-    resources: Seq[(String, String)],
-    isTemp: Boolean)
+    resources: Seq[FunctionResource],
+    isTemp: Boolean,
+    ignoreIfExists: Boolean,
+    replace: Boolean)
   extends RunnableCommand {
 
-  override def run(sqlContext: SQLContext): Seq[Row] = {
-    val catalog = sqlContext.sessionState.catalog
+  if (ignoreIfExists && replace) {
+    throw new AnalysisException("CREATE FUNCTION with both IF NOT EXISTS and REPLACE" +
+      " is not allowed.")
+  }
+
+  // Disallow to define a temporary function with `IF NOT EXISTS`
+  if (ignoreIfExists && isTemp) {
+    throw new AnalysisException(
+      "It is not allowed to define a TEMPORARY function with IF NOT EXISTS.")
+  }
+
+  // Temporary function names should not contain database prefix like "database.function"
+  if (databaseName.isDefined && isTemp) {
+    throw new AnalysisException(s"Specifying a database in CREATE TEMPORARY FUNCTION " +
+      s"is not allowed: '${databaseName.get}'")
+  }
+
+  override def run(sparkSession: SparkSession): Seq[Row] = {
+    val catalog = sparkSession.sessionState.catalog
+    val func = CatalogFunction(FunctionIdentifier(functionName, databaseName), className, resources)
     if (isTemp) {
-      if (databaseName.isDefined) {
-        throw new AnalysisException(
-          s"It is not allowed to provide database name when defining a temporary function. " +
-            s"However, database name ${databaseName.get} is provided.")
-      }
       // We first load resources and then put the builder in the function registry.
-      // Please note that it is allowed to overwrite an existing temp function.
       catalog.loadFunctionResources(resources)
-      val info = new ExpressionInfo(className, functionName)
-      val builder = catalog.makeFunctionBuilder(functionName, className)
-      catalog.createTempFunction(functionName, info, builder, ignoreIfExists = false)
+      catalog.registerFunction(func, overrideIfExists = replace)
     } else {
-      // For a permanent, we will store the metadata into underlying external catalog.
-      // This function will be loaded into the FunctionRegistry when a query uses it.
-      // We do not load it into FunctionRegistry right now.
-      // TODO: should we also parse "IF NOT EXISTS"?
-      catalog.createFunction(
-        CatalogFunction(FunctionIdentifier(functionName, databaseName), className, resources),
-        ignoreIfExists = false)
+      // Handles `CREATE OR REPLACE FUNCTION AS ... USING ...`
+      if (replace && catalog.functionExists(func.identifier)) {
+        // alter the function in the metastore
+        catalog.alterFunction(func)
+      } else {
+        // For a permanent, we will store the metadata into underlying external catalog.
+        // This function will be loaded into the FunctionRegistry when a query uses it.
+        // We do not load it into FunctionRegistry right now.
+        catalog.createFunction(func, ignoreIfExists)
+      }
     }
     Seq.empty[Row]
   }
@@ -82,8 +103,8 @@ case class CreateFunction(
  *   DESCRIBE FUNCTION [EXTENDED] upper;
  * }}}
  */
-case class DescribeFunction(
-    functionName: String,
+case class DescribeFunctionCommand(
+    functionName: FunctionIdentifier,
     isExtended: Boolean) extends RunnableCommand {
 
   override val output: Seq[Attribute] = {
@@ -91,47 +112,45 @@ case class DescribeFunction(
     schema.toAttributes
   }
 
-  private def replaceFunctionName(usage: String, functionName: String): String = {
-    if (usage == null) {
-      "To be added."
-    } else {
-      usage.replaceAll("_FUNC_", functionName)
-    }
-  }
-
-  override def run(sqlContext: SQLContext): Seq[Row] = {
+  override def run(sparkSession: SparkSession): Seq[Row] = {
     // Hard code "<>", "!=", "between", and "case" for now as there is no corresponding functions.
-    functionName.toLowerCase match {
+    functionName.funcName.toLowerCase(Locale.ROOT) match {
       case "<>" =>
         Row(s"Function: $functionName") ::
-          Row(s"Usage: a <> b - Returns TRUE if a is not equal to b") :: Nil
+          Row("Usage: expr1 <> expr2 - " +
+            "Returns true if `expr1` is not equal to `expr2`.") :: Nil
       case "!=" =>
         Row(s"Function: $functionName") ::
-          Row(s"Usage: a != b - Returns TRUE if a is not equal to b") :: Nil
+          Row("Usage: expr1 != expr2 - " +
+            "Returns true if `expr1` is not equal to `expr2`.") :: Nil
       case "between" =>
-        Row(s"Function: between") ::
-          Row(s"Usage: a [NOT] BETWEEN b AND c - " +
-            s"evaluate if a is [not] in between b and c") :: Nil
+        Row("Function: between") ::
+          Row("Usage: expr1 [NOT] BETWEEN expr2 AND expr3 - " +
+            "evaluate if `expr1` is [not] in between `expr2` and `expr3`.") :: Nil
       case "case" =>
-        Row(s"Function: case") ::
-          Row(s"Usage: CASE a WHEN b THEN c [WHEN d THEN e]* [ELSE f] END - " +
-            s"When a = b, returns c; when a = d, return e; else return f") :: Nil
-      case _ => sqlContext.sessionState.functionRegistry.lookupFunction(functionName) match {
-        case Some(info) =>
+        Row("Function: case") ::
+          Row("Usage: CASE expr1 WHEN expr2 THEN expr3 " +
+            "[WHEN expr4 THEN expr5]* [ELSE expr6] END - " +
+            "When `expr1` = `expr2`, returns `expr3`; " +
+            "when `expr1` = `expr4`, return `expr5`; else return `expr6`.") :: Nil
+      case _ =>
+        try {
+          val info = sparkSession.sessionState.catalog.lookupFunctionInfo(functionName)
+          val name = if (info.getDb != null) info.getDb + "." + info.getName else info.getName
           val result =
-            Row(s"Function: ${info.getName}") ::
+            Row(s"Function: $name") ::
               Row(s"Class: ${info.getClassName}") ::
-              Row(s"Usage: ${replaceFunctionName(info.getUsage(), info.getName)}") :: Nil
+              Row(s"Usage: ${info.getUsage}") :: Nil
 
           if (isExtended) {
             result :+
-              Row(s"Extended Usage:\n${replaceFunctionName(info.getExtended, info.getName)}")
+              Row(s"Extended Usage:${info.getExtended}")
           } else {
             result
           }
-
-        case None => Seq(Row(s"Function: $functionName not found."))
-      }
+        } catch {
+          case _: NoSuchFunctionException => Seq(Row(s"Function: $functionName not found."))
+        }
     }
   }
 }
@@ -142,20 +161,22 @@ case class DescribeFunction(
  * ifExists: returns an error if the function doesn't exist, unless this is true.
  * isTemp: indicates if it is a temporary function.
  */
-case class DropFunction(
+case class DropFunctionCommand(
     databaseName: Option[String],
     functionName: String,
     ifExists: Boolean,
     isTemp: Boolean)
   extends RunnableCommand {
 
-  override def run(sqlContext: SQLContext): Seq[Row] = {
-    val catalog = sqlContext.sessionState.catalog
+  override def run(sparkSession: SparkSession): Seq[Row] = {
+    val catalog = sparkSession.sessionState.catalog
     if (isTemp) {
       if (databaseName.isDefined) {
-        throw new AnalysisException(
-          s"It is not allowed to provide database name when dropping a temporary function. " +
-            s"However, database name ${databaseName.get} is provided.")
+        throw new AnalysisException(s"Specifying a database in DROP TEMPORARY FUNCTION " +
+          s"is not allowed: '${databaseName.get}'")
+      }
+      if (FunctionRegistry.builtin.functionExists(FunctionIdentifier(functionName))) {
+        throw new AnalysisException(s"Cannot drop native function '$functionName'")
       }
       catalog.dropTempFunction(functionName, ifExists)
     } else {
@@ -178,25 +199,29 @@ case class DropFunction(
  * For the pattern, '*' matches any sequence of characters (including no characters) and
  * '|' is for alternation.
  * For example, "show functions like 'yea*|windo*'" will return "window" and "year".
- *
- * TODO currently we are simply ignore the db
  */
-case class ShowFunctions(db: Option[String], pattern: Option[String]) extends RunnableCommand {
+case class ShowFunctionsCommand(
+    db: Option[String],
+    pattern: Option[String],
+    showUserFunctions: Boolean,
+    showSystemFunctions: Boolean) extends RunnableCommand {
+
   override val output: Seq[Attribute] = {
     val schema = StructType(StructField("function", StringType, nullable = false) :: Nil)
     schema.toAttributes
   }
 
-  override def run(sqlContext: SQLContext): Seq[Row] = {
-    val dbName = db.getOrElse(sqlContext.sessionState.catalog.getCurrentDatabase)
+  override def run(sparkSession: SparkSession): Seq[Row] = {
+    val dbName = db.getOrElse(sparkSession.sessionState.catalog.getCurrentDatabase)
     // If pattern is not specified, we use '*', which is used to
     // match any sequence of characters (including no characters).
     val functionNames =
-      sqlContext.sessionState.catalog
+      sparkSession.sessionState.catalog
         .listFunctions(dbName, pattern.getOrElse("*"))
-        .map(_.unquotedString)
-    // The session catalog caches some persistent functions in the FunctionRegistry
-    // so there can be duplicates.
-    functionNames.distinct.sorted.map(Row(_))
+        .collect {
+          case (f, "USER") if showUserFunctions => f.unquotedString
+          case (f, "SYSTEM") if showSystemFunctions => f.unquotedString
+        }
+    functionNames.sorted.map(Row(_))
   }
 }

@@ -17,53 +17,28 @@
 
 package org.apache.spark.sql.test
 
-import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.sql.SQLContext
-
-
-/**
- * Helper trait for SQL test suites where all tests share a single [[TestSQLContext]].
- */
-trait SharedSQLContext extends SQLTestUtils {
-
-  protected val sparkConf = new SparkConf()
+trait SharedSQLContext extends SQLTestUtils with SharedSparkSession {
 
   /**
-   * The [[TestSQLContext]] to use for all tests in this suite.
+   * Suites extending [[SharedSQLContext]] are sharing resources (eg. SparkSession) in their tests.
+   * That trait initializes the spark session in its [[beforeAll()]] implementation before the
+   * automatic thread snapshot is performed, so the audit code could fail to report threads leaked
+   * by that shared session.
    *
-   * By default, the underlying [[org.apache.spark.SparkContext]] will be run in local
-   * mode with the default test configurations.
+   * The behavior is overridden here to take the snapshot before the spark session is initialized.
    */
-  private var _ctx: TestSQLContext = null
+  override protected val enableAutoThreadAudit = false
 
-  /**
-   * The [[TestSQLContext]] to use for all tests in this suite.
-   */
-  protected implicit def sqlContext: SQLContext = _ctx
-
-  /**
-   * Initialize the [[TestSQLContext]].
-   */
   protected override def beforeAll(): Unit = {
-    SQLContext.clearSqlListener()
-    if (_ctx == null) {
-      _ctx = new TestSQLContext(sparkConf)
-    }
-    // Ensure we have initialized the context before calling parent code
+    doThreadPreAudit()
     super.beforeAll()
   }
 
-  /**
-   * Stop the underlying [[org.apache.spark.SparkContext]], if any.
-   */
   protected override def afterAll(): Unit = {
     try {
-      if (_ctx != null) {
-        _ctx.sparkContext.stop()
-        _ctx = null
-      }
-    } finally {
       super.afterAll()
+    } finally {
+      doThreadPostAudit()
     }
   }
 }

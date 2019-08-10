@@ -26,6 +26,7 @@ import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.{LabeledPoint, LinearRegressionWithSGD}
 // $example off$
 
+@deprecated("Deprecated since LinearRegressionWithSGD is deprecated.  Use ml.feature.PCA", "2.0.0")
 object PCAExample {
 
   def main(args: Array[String]): Unit = {
@@ -64,8 +65,8 @@ object PCAExample {
     val MSE = valuesAndPreds.map { case (v, p) => math.pow((v - p), 2) }.mean()
     val MSE_pca = valuesAndPreds_pca.map { case (v, p) => math.pow((v - p), 2) }.mean()
 
-    println("Mean Squared Error = " + MSE)
-    println("PCA Mean Squared Error = " + MSE_pca)
+    println(s"Mean Squared Error = $MSE")
+    println(s"PCA Mean Squared Error = $MSE_pca")
     // $example off$
 
     sc.stop()

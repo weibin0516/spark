@@ -36,7 +36,7 @@ class UDFSuite
   with TestHiveSingleton
   with BeforeAndAfterEach {
 
-  import hiveContext.implicits._
+  import spark.implicits._
 
   private[this] val functionName = "myUPper"
   private[this] val functionNameUpper = "MYUPPER"
@@ -53,7 +53,7 @@ class UDFSuite
     sql("USE default")
 
     testDF = (1 to 10).map(i => s"sTr$i").toDF("value")
-    testDF.registerTempTable(testTableName)
+    testDF.createOrReplaceTempView(testTableName)
     expectedDF = (1 to 10).map(i => s"STR$i").toDF("value")
     super.beforeAll()
   }
@@ -64,12 +64,12 @@ class UDFSuite
   }
 
   test("UDF case insensitive") {
-    hiveContext.udf.register("random0", () => { Math.random() })
-    hiveContext.udf.register("RANDOM1", () => { Math.random() })
-    hiveContext.udf.register("strlenScala", (_: String).length + (_: Int))
-    assert(hiveContext.sql("SELECT RANDOM0() FROM src LIMIT 1").head().getDouble(0) >= 0.0)
-    assert(hiveContext.sql("SELECT RANDOm1() FROM src LIMIT 1").head().getDouble(0) >= 0.0)
-    assert(hiveContext.sql("SELECT strlenscala('test', 1) FROM src LIMIT 1").head().getInt(0) === 5)
+    spark.udf.register("random0", () => { Math.random() })
+    spark.udf.register("RANDOM1", () => { Math.random() })
+    spark.udf.register("strlenScala", (_: String).length + (_: Int))
+    assert(sql("SELECT RANDOM0() FROM src LIMIT 1").head().getDouble(0) >= 0.0)
+    assert(sql("SELECT RANDOm1() FROM src LIMIT 1").head().getDouble(0) >= 0.0)
+    assert(sql("SELECT strlenscala('test', 1) FROM src LIMIT 1").head().getInt(0) === 5)
   }
 
   test("temporary function: create and drop") {
@@ -141,11 +141,10 @@ class UDFSuite
     withTempDatabase { dbName =>
       withUserDefinedFunction(functionName -> false) {
         sql(s"CREATE FUNCTION $dbName.$functionName AS '$functionClass'")
-        // TODO: Re-enable it after can distinguish qualified and unqualified function name
-        // checkAnswer(
-        //  sql(s"SELECT $dbName.myuPPer(value) from $testTableName"),
-        //  expectedDF
-        // )
+        checkAnswer(
+          sql(s"SELECT $dbName.$functionName(value) from $testTableName"),
+          expectedDF
+        )
 
         checkAnswer(
           sql(s"SHOW FUNCTIONS like $dbName.$functionNameUpper"),
@@ -174,11 +173,10 @@ class UDFSuite
       // For this block, drop function command uses default.functionName as the function name.
       withUserDefinedFunction(s"$dbName.$functionNameUpper" -> false) {
         sql(s"CREATE FUNCTION $dbName.$functionName AS '$functionClass'")
-        // TODO: Re-enable it after can distinguish qualified and unqualified function name
-        // checkAnswer(
-        //  sql(s"SELECT $dbName.myupper(value) from $testTableName"),
-        //  expectedDF
-        // )
+        checkAnswer(
+          sql(s"SELECT $dbName.$functionName(value) from $testTableName"),
+          expectedDF
+        )
 
         sql(s"USE $dbName")
 
@@ -193,6 +191,22 @@ class UDFSuite
 
         sql(s"USE default")
       }
+    }
+  }
+
+  test("SPARK-21318: The correct exception message should be thrown " +
+    "if a UDF/UDAF has already been registered") {
+    val functionName = "empty"
+    val functionClass = classOf[org.apache.spark.sql.hive.execution.UDAFEmpty].getCanonicalName
+
+    withUserDefinedFunction(functionName -> false) {
+      sql(s"CREATE FUNCTION $functionName AS '$functionClass'")
+
+      val e = intercept[AnalysisException] {
+        sql(s"SELECT $functionName(value) from $testTableName")
+      }
+
+      assert(e.getMessage.contains("Can not get an evaluator of the empty UDAF"))
     }
   }
 }

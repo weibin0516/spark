@@ -17,165 +17,156 @@
 
 package org.apache.spark.sql.internal
 
-import java.util.Properties
+import java.io.File
 
-import scala.collection.JavaConverters._
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.Path
 
-import org.apache.spark.internal.config.ConfigEntry
+import org.apache.spark.SparkContext
+import org.apache.spark.annotation.{Experimental, Unstable}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.analysis.{Analyzer, FunctionRegistry}
-import org.apache.spark.sql.catalyst.catalog.{ArchiveResource, _}
+import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.optimizer.Optimizer
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.command.AnalyzeTable
-import org.apache.spark.sql.execution.datasources.{DataSourceAnalysis, PreInsertCastAndRename, ResolveDataSource}
-import org.apache.spark.sql.util.ExecutionListenerManager
-
+import org.apache.spark.sql.streaming.StreamingQueryManager
+import org.apache.spark.sql.util.{ExecutionListenerManager, QueryExecutionListener}
 
 /**
- * A class that holds all session-specific state in a given [[SQLContext]].
+ * A class that holds all session-specific state in a given [[SparkSession]].
+ *
+ * @param sharedState The state shared across sessions, e.g. global view manager, external catalog.
+ * @param conf SQL-specific key-value configurations.
+ * @param experimentalMethods Interface to add custom planning strategies and optimizers.
+ * @param functionRegistry Internal catalog for managing functions registered by the user.
+ * @param udfRegistration Interface exposed to the user for registering user-defined functions.
+ * @param catalogBuilder a function to create an internal catalog for managing table and database
+ *                       states.
+ * @param sqlParser Parser that extracts expressions, plans, table identifiers etc. from SQL texts.
+ * @param analyzerBuilder A function to create the logical query plan analyzer for resolving
+ *                        unresolved attributes and relations.
+ * @param optimizerBuilder a function to create the logical query plan optimizer.
+ * @param planner Planner that converts optimized logical plans to physical plans.
+ * @param streamingQueryManager Interface to start and stop streaming queries.
+ * @param listenerManager Interface to register custom [[QueryExecutionListener]]s.
+ * @param resourceLoaderBuilder a function to create a session shared resource loader to load JARs,
+ *                              files, etc.
+ * @param createQueryExecution Function used to create QueryExecution objects.
+ * @param createClone Function used to create clones of the session state.
  */
-private[sql] class SessionState(ctx: SQLContext) {
+private[sql] class SessionState(
+    sharedState: SharedState,
+    val conf: SQLConf,
+    val experimentalMethods: ExperimentalMethods,
+    val functionRegistry: FunctionRegistry,
+    val udfRegistration: UDFRegistration,
+    catalogBuilder: () => SessionCatalog,
+    val sqlParser: ParserInterface,
+    analyzerBuilder: () => Analyzer,
+    optimizerBuilder: () => Optimizer,
+    val planner: SparkPlanner,
+    val streamingQueryManager: StreamingQueryManager,
+    val listenerManager: ExecutionListenerManager,
+    resourceLoaderBuilder: () => SessionResourceLoader,
+    createQueryExecution: LogicalPlan => QueryExecution,
+    createClone: (SparkSession, SessionState) => SessionState,
+    val columnarRules: Seq[ColumnarRule]) {
 
-  // Note: These are all lazy vals because they depend on each other (e.g. conf) and we
-  // want subclasses to override some of the fields. Otherwise, we would get a lot of NPEs.
+  // The following fields are lazy to avoid creating the Hive client when creating SessionState.
+  lazy val catalog: SessionCatalog = catalogBuilder()
 
-  /**
-   * SQL-specific key-value configurations.
-   */
-  lazy val conf: SQLConf = new SQLConf
+  lazy val analyzer: Analyzer = analyzerBuilder()
 
-  // Automatically extract `spark.sql.*` entries and put it in our SQLConf
-  setConf(SQLContext.getSQLProperties(ctx.sparkContext.getConf))
+  lazy val optimizer: Optimizer = optimizerBuilder()
 
-  lazy val experimentalMethods = new ExperimentalMethods
+  lazy val resourceLoader: SessionResourceLoader = resourceLoaderBuilder()
 
-  /**
-   * Internal catalog for managing functions registered by the user.
-   */
-  lazy val functionRegistry: FunctionRegistry = FunctionRegistry.builtin.copy()
+  def newHadoopConf(): Configuration = SessionState.newHadoopConf(
+    sharedState.sparkContext.hadoopConfiguration,
+    conf)
 
-  /**
-   * A class for loading resources specified by a function.
-   */
-  lazy val functionResourceLoader: FunctionResourceLoader = {
-    new FunctionResourceLoader {
-      override def loadResource(resource: FunctionResource): Unit = {
-        resource.resourceType match {
-          case JarResource => addJar(resource.uri)
-          case FileResource => ctx.sparkContext.addFile(resource.uri)
-          case ArchiveResource =>
-            throw new AnalysisException(
-              "Archive is not allowed to be loaded. If YARN mode is used, " +
-                "please use --archives options while calling spark-submit.")
-        }
+  def newHadoopConfWithOptions(options: Map[String, String]): Configuration = {
+    val hadoopConf = newHadoopConf()
+    options.foreach { case (k, v) =>
+      if ((v ne null) && k != "path" && k != "paths") {
+        hadoopConf.set(k, v)
       }
     }
+    hadoopConf
   }
 
   /**
-   * Internal catalog for managing table and database states.
+   * Get an identical copy of the `SessionState` and associate it with the given `SparkSession`
    */
-  lazy val catalog =
-    new SessionCatalog(
-      ctx.externalCatalog,
-      functionResourceLoader,
-      functionRegistry,
-      conf)
-
-  /**
-   * Interface exposed to the user for registering user-defined functions.
-   */
-  lazy val udf: UDFRegistration = new UDFRegistration(functionRegistry)
-
-  /**
-   * Logical query plan analyzer for resolving unresolved attributes and relations.
-   */
-  lazy val analyzer: Analyzer = {
-    new Analyzer(catalog, conf) {
-      override val extendedResolutionRules =
-        PreInsertCastAndRename ::
-        DataSourceAnalysis ::
-        (if (conf.runSQLonFile) new ResolveDataSource(ctx) :: Nil else Nil)
-
-      override val extendedCheckRules = Seq(datasources.PreWriteCheck(conf, catalog))
-    }
-  }
-
-  /**
-   * Logical query plan optimizer.
-   */
-  lazy val optimizer: Optimizer = new SparkOptimizer(catalog, conf, experimentalMethods)
-
-  /**
-   * Parser that extracts expressions, plans, table identifiers etc. from SQL texts.
-   */
-  lazy val sqlParser: ParserInterface = new SparkSqlParser(conf)
-
-  /**
-   * Planner that converts optimized logical plans to physical plans.
-   */
-  def planner: SparkPlanner =
-    new SparkPlanner(ctx.sparkContext, conf, experimentalMethods.extraStrategies)
-
-  /**
-   * An interface to register custom [[org.apache.spark.sql.util.QueryExecutionListener]]s
-   * that listen for execution metrics.
-   */
-  lazy val listenerManager: ExecutionListenerManager = new ExecutionListenerManager
-
-  /**
-   * Interface to start and stop [[org.apache.spark.sql.ContinuousQuery]]s.
-   */
-  lazy val continuousQueryManager: ContinuousQueryManager = new ContinuousQueryManager(ctx)
-
+  def clone(newSparkSession: SparkSession): SessionState = createClone(newSparkSession, this)
 
   // ------------------------------------------------------
   //  Helper methods, partially leftover from pre-2.0 days
   // ------------------------------------------------------
 
-  def executePlan(plan: LogicalPlan): QueryExecution = new QueryExecution(ctx, plan)
+  def executePlan(plan: LogicalPlan): QueryExecution = createQueryExecution(plan)
 
   def refreshTable(tableName: String): Unit = {
     catalog.refreshTable(sqlParser.parseTableIdentifier(tableName))
   }
+}
 
-  def invalidateTable(tableName: String): Unit = {
-    catalog.invalidateTable(sqlParser.parseTableIdentifier(tableName))
+private[sql] object SessionState {
+  def newHadoopConf(hadoopConf: Configuration, sqlConf: SQLConf): Configuration = {
+    val newHadoopConf = new Configuration(hadoopConf)
+    sqlConf.getAllConfs.foreach { case (k, v) => if (v ne null) newHadoopConf.set(k, v) }
+    newHadoopConf
   }
+}
 
-  final def setConf(properties: Properties): Unit = {
-    properties.asScala.foreach { case (k, v) => setConf(k, v) }
-  }
+/**
+ * Concrete implementation of a [[BaseSessionStateBuilder]].
+ */
+@Experimental
+@Unstable
+class SessionStateBuilder(
+    session: SparkSession,
+    parentState: Option[SessionState] = None)
+  extends BaseSessionStateBuilder(session, parentState) {
+  override protected def newBuilder: NewBuilder = new SessionStateBuilder(_, _)
+}
 
-  final def setConf[T](entry: ConfigEntry[T], value: T): Unit = {
-    conf.setConf(entry, value)
-    setConf(entry.key, entry.stringConverter(value))
-  }
-
-  def setConf(key: String, value: String): Unit = {
-    conf.setConfString(key, value)
-  }
-
-  def addJar(path: String): Unit = {
-    ctx.sparkContext.addJar(path)
+/**
+ * Session shared [[FunctionResourceLoader]].
+ */
+@Unstable
+class SessionResourceLoader(session: SparkSession) extends FunctionResourceLoader {
+  override def loadResource(resource: FunctionResource): Unit = {
+    resource.resourceType match {
+      case JarResource => addJar(resource.uri)
+      case FileResource => session.sparkContext.addFile(resource.uri)
+      case ArchiveResource =>
+        throw new AnalysisException(
+          "Archive is not allowed to be loaded. If YARN mode is used, " +
+            "please use --archives options while calling spark-submit.")
+    }
   }
 
   /**
-   * Analyzes the given table in the current database to generate statistics, which will be
-   * used in query optimizations.
+   * Add a jar path to [[SparkContext]] and the classloader.
    *
-   * Right now, it only supports catalog tables and it only updates the size of a catalog table
-   * in the external catalog.
+   * Note: this method seems not access any session state, but a Hive based `SessionState` needs
+   * to add the jar to its hive client for the current session. Hence, it still needs to be in
+   * [[SessionState]].
    */
-  def analyze(tableName: String): Unit = {
-    AnalyzeTable(tableName).run(ctx)
+  def addJar(path: String): Unit = {
+    session.sparkContext.addJar(path)
+    val uri = new Path(path).toUri
+    val jarURL = if (uri.getScheme == null) {
+      // `path` is a local file path without a URL scheme
+      new File(path).toURI.toURL
+    } else {
+      // `path` is a URL with a scheme
+      uri.toURL
+    }
+    session.sharedState.jarClassLoader.addURL(jarURL)
+    Thread.currentThread().setContextClassLoader(session.sharedState.jarClassLoader)
   }
-
-  def runNativeSql(sql: String): Seq[String] = {
-    throw new AnalysisException("Unsupported query: " + sql)
-  }
-
 }

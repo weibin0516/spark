@@ -67,7 +67,7 @@ class StreamingKMeansSuite extends SparkFunSuite with TestSuiteBase {
     // estimated center from streaming should exactly match the arithmetic mean of all data points
     // because the decay factor is set to 1.0
     val grandMean =
-      input.flatten.map(x => x.toBreeze).reduce(_ + _) / (numBatches * numPoints).toDouble
+      input.flatten.map(x => x.asBreeze).reduce(_ + _) / (numBatches * numPoints).toDouble
     assert(model.latestModel().clusterCenters(0) ~== Vectors.dense(grandMean.toArray) absTol 1E-5)
   }
 
@@ -77,6 +77,7 @@ class StreamingKMeansSuite extends SparkFunSuite with TestSuiteBase {
     val k = 2
     val d = 5
     val r = 0.1
+    val seed = 987654321
 
     // create model with two clusters
     val kMeans = new StreamingKMeans()
@@ -88,7 +89,7 @@ class StreamingKMeansSuite extends SparkFunSuite with TestSuiteBase {
         Array(5.0, 5.0))
 
     // generate random data for k-means
-    val (input, centers) = StreamingKMeansDataGenerator(numPoints, numBatches, k, d, r, 42)
+    val (input, centers) = StreamingKMeansDataGenerator(numPoints, numBatches, k, d, r, seed)
 
     // setup and run the model training
     ssc = setupStreams(input, (inputDStream: DStream[Vector]) => {

@@ -26,6 +26,7 @@ import org.apache.spark.mllib.regression.LinearRegressionModel
 import org.apache.spark.mllib.regression.LinearRegressionWithSGD
 // $example off$
 
+@deprecated("Use ml.regression.LinearRegression or LBFGS", "2.0.0")
 object LinearRegressionWithSGDExample {
 
   def main(args: Array[String]): Unit = {
@@ -51,7 +52,7 @@ object LinearRegressionWithSGDExample {
       (point.label, prediction)
     }
     val MSE = valuesAndPreds.map{ case(v, p) => math.pow((v - p), 2) }.mean()
-    println("training Mean Squared Error = " + MSE)
+    println(s"training Mean Squared Error $MSE")
 
     // Save and load model
     model.save(sc, "target/tmp/scalaLinearRegressionWithSGDModel")

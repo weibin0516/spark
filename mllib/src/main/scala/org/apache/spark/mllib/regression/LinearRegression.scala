@@ -44,15 +44,13 @@ class LinearRegressionModel @Since("1.1.0") (
       dataMatrix: Vector,
       weightMatrix: Vector,
       intercept: Double): Double = {
-    weightMatrix.toBreeze.dot(dataMatrix.toBreeze) + intercept
+    weightMatrix.asBreeze.dot(dataMatrix.asBreeze) + intercept
   }
 
   @Since("1.3.0")
   override def save(sc: SparkContext, path: String): Unit = {
     GLMRegressionModel.SaveLoadV1_0.save(sc, path, this.getClass.getName, weights, intercept)
   }
-
-  override protected def formatVersion: String = "1.0"
 }
 
 @Since("1.3.0")
@@ -107,6 +105,7 @@ class LinearRegressionWithSGD private[mllib] (
    * numIterations: 100, miniBatchFraction: 1.0}.
    */
   @Since("0.8.0")
+  @deprecated("Use ml.regression.LinearRegression or LBFGS", "2.0.0")
   def this() = this(1.0, 100, 0.0, 1.0)
 
   override protected[mllib] def createModel(weights: Vector, intercept: Double) = {
@@ -119,6 +118,7 @@ class LinearRegressionWithSGD private[mllib] (
  *
  */
 @Since("0.8.0")
+@deprecated("Use ml.regression.LinearRegression or LBFGS", "2.0.0")
 object LinearRegressionWithSGD {
 
   /**

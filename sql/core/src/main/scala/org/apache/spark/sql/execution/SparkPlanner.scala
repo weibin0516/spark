@@ -20,31 +20,52 @@ package org.apache.spark.sql.execution
 import org.apache.spark.SparkContext
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
 import org.apache.spark.sql.internal.SQLConf
 
 class SparkPlanner(
     val sparkContext: SparkContext,
     val conf: SQLConf,
-    val extraStrategies: Seq[Strategy])
+    val experimentalMethods: ExperimentalMethods)
   extends SparkStrategies {
 
   def numPartitions: Int = conf.numShufflePartitions
 
-  def strategies: Seq[Strategy] =
-      extraStrategies ++ (
+  override def strategies: Seq[Strategy] =
+    experimentalMethods.extraStrategies ++
+      extraPlanningStrategies ++ (
+      LogicalQueryStageStrategy ::
+      PythonEvals ::
+      DataSourceV2Strategy ::
       FileSourceStrategy ::
-      DataSourceStrategy ::
-      DDLStrategy ::
+      DataSourceStrategy(conf) ::
       SpecialLimits ::
       Aggregation ::
-      ExistenceJoin ::
-      EquiJoinSelection ::
+      Window ::
+      JoinSelection ::
       InMemoryScans ::
-      BasicOperators ::
-      BroadcastNestedLoop ::
-      CartesianProduct ::
-      DefaultJoin :: Nil)
+      BasicOperators :: Nil)
+
+  /**
+   * Override to add extra planning strategies to the planner. These strategies are tried after
+   * the strategies defined in [[ExperimentalMethods]], and before the regular strategies.
+   */
+  def extraPlanningStrategies: Seq[Strategy] = Nil
+
+  override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
+    plan.collect {
+      case placeholder @ PlanLater(logicalPlan) => placeholder -> logicalPlan
+    }
+  }
+
+  override protected def prunePlans(plans: Iterator[SparkPlan]): Iterator[SparkPlan] = {
+    // TODO: We will need to prune bad plans when we improve plan space exploration
+    //       to prevent combinatorial explosion.
+    plans
+  }
 
   /**
    * Used to build table scan operators where complex projection and filtering are done using
