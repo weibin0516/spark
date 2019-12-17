@@ -29,10 +29,10 @@ import org.apache.spark.sql.execution.exchange.{EnsureRequirements, ReusedExchan
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
-class PlannerSuite extends SharedSQLContext {
+class PlannerSuite extends SharedSparkSession {
   import testImplicits._
 
   setupTestData()
@@ -172,7 +172,7 @@ class PlannerSuite extends SharedSQLContext {
   }
 
   test("SPARK-11390 explain should print PushedFilters of PhysicalRDD") {
-    withSQLConf(SQLConf.USE_V1_SOURCE_READER_LIST.key -> "parquet") {
+    withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
       withTempPath { file =>
         val path = file.getCanonicalPath
         testData.write.parquet(path)
@@ -855,6 +855,30 @@ class PlannerSuite extends SharedSQLContext {
         StructField("f1", StringType, nullable = true),
         StructField("f2", StringType, nullable = true),
         StructField("f3", StringType, nullable = false))))
+  }
+
+  test("Do not analyze subqueries twice") {
+    // Analyzing the subquery twice will result in stacked
+    // CheckOverflow & PromotePrecision expressions.
+    val df = sql(
+      """
+        |SELECT id,
+        |       (SELECT 1.3000000 * AVG(CAST(id AS DECIMAL(10, 3))) FROM range(13)) AS ref
+        |FROM   range(5)
+        |""".stripMargin)
+
+    val Seq(subquery) = df.queryExecution.executedPlan.subqueriesAll
+    subquery.foreach { node =>
+      node.expressions.foreach { expression =>
+        expression.foreach {
+          case PromotePrecision(_: PromotePrecision) =>
+            fail(s"$expression contains stacked PromotePrecision expressions.")
+          case CheckOverflow(_: CheckOverflow, _, _) =>
+            fail(s"$expression contains stacked CheckOverflow expressions.")
+          case _ => // Ok
+        }
+      }
+    }
   }
 }
 

@@ -33,13 +33,12 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.optimizer.InferFiltersFromConstraints
 import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, HadoopFsRelation, LogicalRelation}
-import org.apache.spark.sql.execution.datasources.orc.OrcFilters
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetTable
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
+import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.ParquetOutputTimestampType
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.util.{AccumulatorContext, AccumulatorV2}
 
@@ -61,7 +60,7 @@ import org.apache.spark.util.{AccumulatorContext, AccumulatorV2}
  * dependent on this configuration, don't forget you better explicitly set this configuration
  * within the test.
  */
-abstract class ParquetFilterSuite extends QueryTest with ParquetTest with SharedSQLContext {
+abstract class ParquetFilterSuite extends QueryTest with ParquetTest with SharedSparkSession {
 
   protected def createParquetFilters(
       schema: MessageType,
@@ -1397,8 +1396,7 @@ class ParquetV1FilterSuite extends ParquetFilterSuite {
   override protected def sparkConf: SparkConf =
     super
       .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_READER_LIST, "parquet")
-      .set(SQLConf.USE_V1_SOURCE_WRITER_LIST, "parquet")
+      .set(SQLConf.USE_V1_SOURCE_LIST, "parquet")
 
   override def checkFilterPredicate(
       df: DataFrame,
@@ -1458,7 +1456,7 @@ class ParquetV2FilterSuite extends ParquetFilterSuite {
   override protected def sparkConf: SparkConf =
     super
       .sparkConf
-      .set(SQLConf.USE_V1_SOURCE_READER_LIST, "")
+      .set(SQLConf.USE_V1_SOURCE_LIST, "")
 
   override def checkFilterPredicate(
       df: DataFrame,
@@ -1485,12 +1483,10 @@ class ParquetV2FilterSuite extends ParquetFilterSuite {
 
       query.queryExecution.optimizedPlan.collectFirst {
         case PhysicalOperation(_, filters,
-        DataSourceV2Relation(parquetTable: ParquetTable, _, options)) =>
+            DataSourceV2ScanRelation(_, scan: ParquetScan, _)) =>
           assert(filters.nonEmpty, "No filter is analyzed from the given query")
-          val scanBuilder = parquetTable.newScanBuilder(options)
           val sourceFilters = filters.flatMap(DataSourceStrategy.translateFilter).toArray
-          scanBuilder.pushFilters(sourceFilters)
-          val pushedFilters = scanBuilder.pushedFilters()
+          val pushedFilters = scan.pushedFilters
           assert(pushedFilters.nonEmpty, "No filter is pushed down")
           val schema = new SparkToParquetSchemaConverter(conf).convert(df.schema)
           val parquetFilters = createParquetFilters(schema)

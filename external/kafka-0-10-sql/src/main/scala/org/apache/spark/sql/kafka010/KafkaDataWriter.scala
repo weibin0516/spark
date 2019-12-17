@@ -21,7 +21,7 @@ import java.{util => ju}
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.sources.v2.writer._
+import org.apache.spark.sql.connector.write.{DataWriter, WriterCommitMessage}
 
 /**
  * Dummy commit message. The DataSourceV2 framework requires a commit message implementation but we
@@ -63,7 +63,10 @@ private[kafka010] class KafkaDataWriter(
 
   def abort(): Unit = {}
 
-  def close(): Unit = {
+  def close(): Unit = {}
+
+  /** explicitly invalidate producer from pool. only for testing. */
+  private[kafka010] def invalidateProducer(): Unit = {
     checkForErrors()
     if (producer != null) {
       producer.flush()

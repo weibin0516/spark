@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.spark.sql.execution.adaptive.rule
+package org.apache.spark.sql.execution.adaptive
 
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.Duration
@@ -27,7 +27,6 @@ import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ShuffledRowRDD, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.adaptive.{QueryStageExec, ReusedQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.ThreadUtils
 
@@ -64,17 +63,21 @@ case class ReduceNumShufflePartitions(conf: SQLConf) extends Rule[SparkPlan] {
       return plan
     }
 
-    val shuffleStages = plan.collect {
-      case stage: ShuffleQueryStageExec => stage
-      case ReusedQueryStageExec(_, stage: ShuffleQueryStageExec, _) => stage
+    def collectShuffleStages(plan: SparkPlan): Seq[ShuffleQueryStageExec] = plan match {
+      case _: LocalShuffleReaderExec => Nil
+      case stage: ShuffleQueryStageExec => Seq(stage)
+      case ReusedQueryStageExec(_, stage: ShuffleQueryStageExec, _) => Seq(stage)
+      case _ => plan.children.flatMap(collectShuffleStages)
     }
+
+    val shuffleStages = collectShuffleStages(plan)
     // ShuffleExchanges introduced by repartition do not support changing the number of partitions.
     // We change the number of partitions in the stage only if all the ShuffleExchanges support it.
     if (!shuffleStages.forall(_.plan.canChangeNumPartitions)) {
       plan
     } else {
       val shuffleMetrics = shuffleStages.map { stage =>
-        val metricsFuture = stage.mapOutputStatisticsFuture
+        val metricsFuture = stage.plan.mapOutputStatisticsFuture
         assert(metricsFuture.isCompleted, "ShuffleQueryStageExec should already be ready")
         ThreadUtils.awaitResult(metricsFuture, Duration.Zero)
       }
@@ -82,7 +85,12 @@ case class ReduceNumShufflePartitions(conf: SQLConf) extends Rule[SparkPlan] {
       // `ShuffleQueryStageExec` gives null mapOutputStatistics when the input RDD has 0 partitions,
       // we should skip it when calculating the `partitionStartIndices`.
       val validMetrics = shuffleMetrics.filter(_ != null)
-      if (validMetrics.nonEmpty) {
+      // We may have different pre-shuffle partition numbers, don't reduce shuffle partition number
+      // in that case. For example when we union fully aggregated data (data is arranged to a single
+      // partition) and a result of a SortMergeJoin (multiple partitions).
+      val distinctNumPreShufflePartitions =
+        validMetrics.map(stats => stats.bytesByPartitionId.length).distinct
+      if (validMetrics.nonEmpty && distinctNumPreShufflePartitions.length == 1) {
         val partitionStartIndices = estimatePartitionStartIndices(validMetrics.toArray)
         // This transformation adds new nodes, so we must use `transformUp` here.
         plan.transformUp {
@@ -173,13 +181,18 @@ case class ReduceNumShufflePartitions(conf: SQLConf) extends Rule[SparkPlan] {
   }
 }
 
+/**
+ * A wrapper of shuffle query stage, which submits fewer reduce task as one reduce task may read
+ * multiple shuffle partitions. This can avoid many small reduce tasks that hurt performance.
+ *
+ * @param child It's usually `ShuffleQueryStageExec` or `ReusedQueryStageExec`, but can be the
+ *              shuffle exchange node during canonicalization.
+ */
 case class CoalescedShuffleReaderExec(
-    child: QueryStageExec,
+    child: SparkPlan,
     partitionStartIndices: Array[Int]) extends UnaryExecNode {
 
   override def output: Seq[Attribute] = child.output
-
-  override def doCanonicalize(): SparkPlan = child.canonicalized
 
   override def outputPartitioning: Partitioning = {
     UnknownPartitioning(partitionStartIndices.length)

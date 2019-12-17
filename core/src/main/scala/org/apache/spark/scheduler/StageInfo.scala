@@ -52,7 +52,7 @@ class StageInfo(
    */
   val accumulables = HashMap[Long, AccumulableInfo]()
 
-  def stageFailed(reason: String) {
+  def stageFailed(reason: String): Unit = {
     failureReason = Some(reason)
     completionTime = Some(System.currentTimeMillis)
   }
@@ -107,4 +107,7 @@ private[spark] object StageInfo {
       taskLocalityPreferences,
       shuffleDepId)
   }
+
+  final val INVALID_STAGE_ID = -1
+  final val INVALID_ATTEMPT_ID = -1
 }

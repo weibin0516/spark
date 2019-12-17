@@ -29,19 +29,19 @@ import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeTestUtils}
-import org.apache.spark.sql.execution.DataSourceScanExec
+import org.apache.spark.sql.execution.{DataSourceScanExec, ExtendedMode}
 import org.apache.spark.sql.execution.command.{ExplainCommand, ShowCreateTableCommand}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.jdbc.{JDBCOptions, JDBCPartition, JDBCRDD, JDBCRelation, JdbcUtils}
 import org.apache.spark.sql.execution.metric.InputOutputMetricsHelper
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources._
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
 class JDBCSuite extends QueryTest
-  with BeforeAndAfter with PrivateMethodTester with SharedSQLContext {
+  with BeforeAndAfter with PrivateMethodTester with SharedSparkSession {
   import testImplicits._
 
   val url = "jdbc:h2:mem:testdb0"
@@ -51,7 +51,7 @@ class JDBCSuite extends QueryTest
   val testBytes = Array[Byte](99.toByte, 134.toByte, 135.toByte, 200.toByte, 205.toByte)
 
   val testH2Dialect = new JdbcDialect {
-    override def canHandle(url: String) : Boolean = url.startsWith("jdbc:h2")
+    override def canHandle(url: String): Boolean = url.startsWith("jdbc:h2")
     override def getCatalystType(
         sqlType: Int, typeName: String, size: Int, md: MetadataBuilder): Option[DataType] =
       Some(StringType)
@@ -450,15 +450,6 @@ class JDBCSuite extends QueryTest
       urlWithUserAndPass, "TEST.PEOPLE", new Properties()).collect().length === 3)
   }
 
-  test("Basic API with illegal fetchsize") {
-    val properties = new Properties()
-    properties.setProperty(JDBCOptions.JDBC_BATCH_FETCH_SIZE, "-1")
-    val e = intercept[IllegalArgumentException] {
-      spark.read.jdbc(urlWithUserAndPass, "TEST.PEOPLE", properties).collect()
-    }.getMessage
-    assert(e.contains("Invalid value `-1` for parameter `fetchsize`"))
-  }
-
   test("Missing partition columns") {
     withView("tempPeople") {
       val e = intercept[IllegalArgumentException] {
@@ -743,7 +734,7 @@ class JDBCSuite extends QueryTest
   }
 
   test("compile filters") {
-    val compileFilter = PrivateMethod[Option[String]]('compileFilter)
+    val compileFilter = PrivateMethod[Option[String]](Symbol("compileFilter"))
     def doCompileFilter(f: Filter): String =
       JDBCRDD invokePrivate compileFilter(f, JdbcDialects.get("jdbc:")) getOrElse("")
     assert(doCompileFilter(EqualTo("col0", 3)) === """"col0" = 3""")
@@ -983,7 +974,7 @@ class JDBCSuite extends QueryTest
 
   test("test credentials in the properties are not in plan output") {
     val df = sql("SELECT * FROM parts")
-    val explain = ExplainCommand(df.queryExecution.logical, extended = true)
+    val explain = ExplainCommand(df.queryExecution.logical, ExtendedMode)
     spark.sessionState.executePlan(explain).executedPlan.executeCollect().foreach {
       r => assert(!List("testPass", "testUser").exists(r.toString.contains))
     }
@@ -996,7 +987,7 @@ class JDBCSuite extends QueryTest
 
   test("test credentials in the connection url are not in the plan output") {
     val df = spark.read.jdbc(urlWithUserAndPass, "TEST.PEOPLE", new Properties())
-    val explain = ExplainCommand(df.queryExecution.logical, extended = true)
+    val explain = ExplainCommand(df.queryExecution.logical, ExtendedMode)
     spark.sessionState.executePlan(explain).executedPlan.executeCollect().foreach {
       r => assert(!List("testPass", "testUser").exists(r.toString.contains))
     }
@@ -1018,7 +1009,7 @@ class JDBCSuite extends QueryTest
              | password '$password')
            """.stripMargin)
 
-        val explain = ExplainCommand(df.queryExecution.logical, extended = true)
+        val explain = ExplainCommand(df.queryExecution.logical, ExtendedMode)
         spark.sessionState.executePlan(explain).executedPlan.executeCollect().foreach { r =>
           assert(!r.toString.contains(password))
         }
@@ -1031,6 +1022,46 @@ class JDBCSuite extends QueryTest
   }
 
   test("Hide credentials in show create table") {
+    val userName = "testUser"
+    val password = "testPass"
+    val tableName = "tab1"
+    val dbTable = "TEST.PEOPLE"
+    withTable(tableName) {
+      sql(
+        s"""
+           |CREATE TABLE $tableName
+           |USING org.apache.spark.sql.jdbc
+           |OPTIONS (
+           | url '$urlWithUserAndPass',
+           | dbtable '$dbTable',
+           | user '$userName',
+           | password '$password')
+         """.stripMargin)
+
+      val show = ShowCreateTableCommand(TableIdentifier(tableName))
+      spark.sessionState.executePlan(show).executedPlan.executeCollect().foreach { r =>
+        assert(!r.toString.contains(password))
+        assert(r.toString.contains(dbTable))
+        assert(r.toString.contains(userName))
+      }
+
+      sql(s"SHOW CREATE TABLE $tableName").collect().foreach { r =>
+        assert(!r.toString.contains(password))
+        assert(r.toString.contains(dbTable))
+        assert(r.toString.contains(userName))
+      }
+
+      withSQLConf(SQLConf.SQL_OPTIONS_REDACTION_PATTERN.key -> "(?i)dbtable|user") {
+        spark.sessionState.executePlan(show).executedPlan.executeCollect().foreach { r =>
+          assert(!r.toString.contains(password))
+          assert(!r.toString.contains(dbTable))
+          assert(!r.toString.contains(userName))
+        }
+      }
+    }
+  }
+
+  test("Replace CatalogUtils.maskCredentials with SQLConf.get.redactOptions") {
     val password = "testPass"
     val tableName = "tab1"
     withTable(tableName) {
@@ -1045,13 +1076,29 @@ class JDBCSuite extends QueryTest
            | password '$password')
          """.stripMargin)
 
-      val show = ShowCreateTableCommand(TableIdentifier(tableName))
-      spark.sessionState.executePlan(show).executedPlan.executeCollect().foreach { r =>
-        assert(!r.toString.contains(password))
+      val storageProps = sql(s"DESC FORMATTED $tableName")
+        .filter("col_name = 'Storage Properties'")
+        .select("data_type").collect()
+      assert(storageProps.length === 1)
+      storageProps.foreach { r =>
+        assert(r.getString(0).contains(s"url=${Utils.REDACTION_REPLACEMENT_TEXT}"))
+        assert(r.getString(0).contains(s"password=${Utils.REDACTION_REPLACEMENT_TEXT}"))
       }
 
-      sql(s"SHOW CREATE TABLE $tableName").collect().foreach { r =>
-        assert(!r.toString().contains(password))
+      val information = sql(s"SHOW TABLE EXTENDED LIKE '$tableName'")
+        .select("information").collect()
+      assert(information.length === 1)
+      information.foreach { r =>
+        assert(r.getString(0).contains(s"url=${Utils.REDACTION_REPLACEMENT_TEXT}"))
+        assert(r.getString(0).contains(s"password=${Utils.REDACTION_REPLACEMENT_TEXT}"))
+      }
+
+      val createTabStmt = sql(s"SHOW CREATE TABLE $tableName")
+        .select("createtab_stmt").collect()
+      assert(createTabStmt.length === 1)
+      createTabStmt.foreach { r =>
+        assert(r.getString(0).contains(s"`url` '${Utils.REDACTION_REPLACEMENT_TEXT}'"))
+        assert(r.getString(0).contains(s"`password` '${Utils.REDACTION_REPLACEMENT_TEXT}'"))
       }
     }
   }
@@ -1601,5 +1648,35 @@ class JDBCSuite extends QueryTest
         }
       }
     }
+  }
+
+  test("Add exception when isolationLevel is Illegal") {
+    val e = intercept[IllegalArgumentException] {
+      spark.read.format("jdbc")
+        .option("Url", urlWithUserAndPass)
+        .option("dbTable", "test.people")
+        .option("isolationLevel", "test")
+        .load()
+    }.getMessage
+    assert(e.contains(
+      "Invalid value `test` for parameter `isolationLevel`. This can be " +
+      "`NONE`, `READ_UNCOMMITTED`, `READ_COMMITTED`, `REPEATABLE_READ` or `SERIALIZABLE`."))
+  }
+
+  test("SPARK-28552: Case-insensitive database URLs in JdbcDialect") {
+    assert(JdbcDialects.get("jdbc:mysql://localhost/db") === MySQLDialect)
+    assert(JdbcDialects.get("jdbc:MySQL://localhost/db") === MySQLDialect)
+    assert(JdbcDialects.get("jdbc:postgresql://localhost/db") === PostgresDialect)
+    assert(JdbcDialects.get("jdbc:postGresql://localhost/db") === PostgresDialect)
+    assert(JdbcDialects.get("jdbc:db2://localhost/db") === DB2Dialect)
+    assert(JdbcDialects.get("jdbc:DB2://localhost/db") === DB2Dialect)
+    assert(JdbcDialects.get("jdbc:sqlserver://localhost/db") === MsSqlServerDialect)
+    assert(JdbcDialects.get("jdbc:sqlServer://localhost/db") === MsSqlServerDialect)
+    assert(JdbcDialects.get("jdbc:derby://localhost/db") === DerbyDialect)
+    assert(JdbcDialects.get("jdbc:derBy://localhost/db") === DerbyDialect)
+    assert(JdbcDialects.get("jdbc:oracle://localhost/db") === OracleDialect)
+    assert(JdbcDialects.get("jdbc:Oracle://localhost/db") === OracleDialect)
+    assert(JdbcDialects.get("jdbc:teradata://localhost/db") === TeradataDialect)
+    assert(JdbcDialects.get("jdbc:Teradata://localhost/db") === TeradataDialect)
   }
 }

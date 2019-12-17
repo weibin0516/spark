@@ -24,16 +24,16 @@ import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.util.Utils
 
 private[spark] case class WorkerResourceInfo(name: String, addresses: Seq[String])
-  extends ResourceAllocator(name, addresses) {
+  extends ResourceAllocator {
 
-  def toResourceInformation(): ResourceInformation = {
-    new ResourceInformation(name, addresses.toArray)
-  }
+  override protected def resourceName = this.name
+  override protected def resourceAddresses = this.addresses
+  override protected def slotsPerAddress: Int = 1
 
   def acquire(amount: Int): ResourceInformation = {
     val allocated = availableAddrs.take(amount)
     acquire(allocated)
-    new ResourceInformation(name, allocated.toArray)
+    new ResourceInformation(resourceName, allocated.toArray)
   }
 }
 
@@ -45,8 +45,7 @@ private[spark] class WorkerInfo(
     val memory: Int,
     val endpoint: RpcEndpointRef,
     val webUiAddress: String,
-    val resources: Map[String, WorkerResourceInfo],
-    val pid: Int = 0)
+    val resources: Map[String, WorkerResourceInfo])
   extends Serializable {
 
   Utils.checkHost(host)
@@ -64,9 +63,27 @@ private[spark] class WorkerInfo(
 
   def coresFree: Int = cores - coresUsed
   def memoryFree: Int = memory - memoryUsed
-  def resourcesFree: Map[String, Int] = {
+  def resourcesAmountFree: Map[String, Int] = {
     resources.map { case (rName, rInfo) =>
       rName -> rInfo.availableAddrs.length
+    }
+  }
+
+  def resourcesInfo: Map[String, ResourceInformation] = {
+    resources.map { case (rName, rInfo) =>
+      rName -> new ResourceInformation(rName, rInfo.addresses.toArray)
+    }
+  }
+
+  def resourcesInfoFree: Map[String, ResourceInformation] = {
+    resources.map { case (rName, rInfo) =>
+      rName -> new ResourceInformation(rName, rInfo.availableAddrs.toArray)
+    }
+  }
+
+  def resourcesInfoUsed: Map[String, ResourceInformation] = {
+    resources.map { case (rName, rInfo) =>
+      rName -> new ResourceInformation(rName, rInfo.assignedAddrs.toArray)
     }
   }
 
@@ -75,7 +92,7 @@ private[spark] class WorkerInfo(
     init()
   }
 
-  private def init() {
+  private def init(): Unit = {
     executors = new mutable.HashMap
     drivers = new mutable.HashMap
     state = WorkerState.ALIVE
@@ -89,13 +106,13 @@ private[spark] class WorkerInfo(
     host + ":" + port
   }
 
-  def addExecutor(exec: ExecutorDesc) {
+  def addExecutor(exec: ExecutorDesc): Unit = {
     executors(exec.fullId) = exec
     coresUsed += exec.cores
     memoryUsed += exec.memory
   }
 
-  def removeExecutor(exec: ExecutorDesc) {
+  def removeExecutor(exec: ExecutorDesc): Unit = {
     if (executors.contains(exec.fullId)) {
       executors -= exec.fullId
       coresUsed -= exec.cores
@@ -108,13 +125,13 @@ private[spark] class WorkerInfo(
     executors.values.exists(_.application == app)
   }
 
-  def addDriver(driver: DriverInfo) {
+  def addDriver(driver: DriverInfo): Unit = {
     drivers(driver.id) = driver
     memoryUsed += driver.desc.mem
     coresUsed += driver.desc.cores
   }
 
-  def removeDriver(driver: DriverInfo) {
+  def removeDriver(driver: DriverInfo): Unit = {
     drivers -= driver.id
     memoryUsed -= driver.desc.mem
     coresUsed -= driver.desc.cores
